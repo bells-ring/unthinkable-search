@@ -43,6 +43,7 @@ $app = Stage "unthinkable-search-$ver-windows-x64" @{
     'usc.exe'   = Join-Path $rel 'usc.exe'
     'README.md' = Join-Path $root 'README.md'
     'README.ru.md' = Join-Path $root 'README.ru.md'
+    'LICENSE'   = Join-Path $root 'LICENSE'
 }
 $sdk = Stage "unthinkable-search-sdk-$ver-windows-x64" @{
     'unthinkable_search.dll'        = $dll
@@ -53,9 +54,11 @@ $sdk = Stage "unthinkable-search-sdk-$ver-windows-x64" @{
     'examples'                      = Join-Path $root 'examples'
     'README.md'                     = Join-Path $root 'README.md'
     'README.ru.md'                  = Join-Path $root 'README.ru.md'
+    'LICENSE'                       = Join-Path $root 'LICENSE'
 }
 
 $sums = foreach ($f in @($app, $sdk)) { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower(), $f.Name }
 $sums | Out-File -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
 foreach ($f in @($app, $sdk)) { '{0,-48} {1,8:N0} KB' -f $f.Name, ($f.Length / 1KB) }
 $sums
+
