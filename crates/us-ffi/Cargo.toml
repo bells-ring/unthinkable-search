@@ -1,0 +1,15 @@
+[package]
+name = "us-ffi"
+description = "C ABI (unthinkable_search.dll) for embedding unthinkable-search in other programs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "unthinkable_search"
+crate-type = ["cdylib"]
+
+[dependencies]
+us = { version = "0.1.0", path = "../us" }
+us-core = { version = "0.1.0", path = "../us-core" }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }

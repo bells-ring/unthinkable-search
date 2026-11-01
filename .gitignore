@@ -1,0 +1,26 @@
+# Whitelist: the repository holds only what is needed to build, use and
+# verify the project. All other files in this folder (portable toolchain,
+# build output, index data, local tools and notes) stay local.
+/*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/LICENSE
+!/README.md
+!/README.ru.md
+!/crates/
+!/docs/
+!/examples/
+!/tools/
+/tools/*
+!/tools/serve-smoke.ps1
+!/tools/dll-smoke.ps1
+!/tools/package.ps1
+
+# Never commit build output, index files or temp files from anywhere.
+target/
+data/
+*.usdb
+*.tmp
+*.pdb
+__pycache__/

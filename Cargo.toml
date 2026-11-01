@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/us-core", "crates/us-win", "crates/us", "crates/us-ffi"]
+# `cargo build --release` builds the programs; the DLL has its own profile:
+#   cargo build --profile release-dll -p us-ffi
+default-members = ["crates/us-core", "crates/us-win", "crates/us"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+# unthinkable_search.dll: a panic must become an error code, not kill the host.
+[profile.release-dll]
+inherits = "release"
+panic = "unwind"
+
+[profile.bench-dbg]
+inherits = "release"
+debug = true
+strip = false
