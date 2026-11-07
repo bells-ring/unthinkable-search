@@ -7,7 +7,7 @@ default-members = ["crates/us-core", "crates/us-win", "crates/us"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT"
 
 [profile.release]
