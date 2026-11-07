@@ -3,7 +3,7 @@
 //! ```text
 //! magic  "USDB" u32 version  [v3+: u32 fold_version]  u64 entry_count  u32 volume_count
 //! per volume: u32 root_len, root bytes, u8 kind, u32 serial, u64 journal_id, i64 next_usn, u32 root_entry
-//! columns (each: u64 byte_len, bytes): names, names_off, folded, folded_off, parent, size, mtime, ctime, attrs, rec, vol
+//! columns (each: u64 byte_len, bytes): names, names_off, folded, folded_off, parent, size, mtime, ctime, attrs, rec, vol, orig_ids, orig_off, orig_names
 //! u64 FNV-1a checksum of all preceding bytes
 //! ```
 //! Columns are read straight into their final `Vec<T>` (no intermediate copy).
@@ -17,9 +17,13 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"USDB";
-const VERSION: u32 = 4;
-/// Oldest file version we can still read (v3 had no creation times → full reindex).
+const VERSION: u32 = 5;
+/// Oldest file version we can still read (v3 had no creation times → full
+/// reindex). v4 has no original names of Recycle Bin items: it loads with its
+/// USN cursors reset, so connected volumes are rescanned while the entries of
+/// disconnected ones stay searchable.
 const MIN_VERSION: u32 = 4;
+const FIRST_VERSION_WITH_RECYCLE: u32 = 5;
 
 fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
@@ -65,13 +69,17 @@ fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 pub fn save(ix: &Index, path: &Path) -> io::Result<()> {
+    save_version(ix, path, VERSION)
+}
+
+fn save_version(ix: &Index, path: &Path, version: u32) -> io::Result<()> {
     // Per-process temp name: GUI, `usc serve` and the DLL may share one data dir.
     let tmp = path.with_extension(format!("usdb.{}.tmp", std::process::id()));
     {
         let f = File::create(&tmp)?;
         let mut w = HW { w: BufWriter::with_capacity(1 << 20, f), h: Hasher::new() };
         w.put(MAGIC)?;
-        w.put(&VERSION.to_le_bytes())?;
+        w.put(&version.to_le_bytes())?;
         w.put(&crate::fold::FOLD_VERSION.to_le_bytes())?;
         w.put(&(ix.len() as u64).to_le_bytes())?;
         w.put(&(ix.volumes.len() as u32).to_le_bytes())?;
@@ -95,6 +103,11 @@ pub fn save(ix: &Index, path: &Path) -> io::Result<()> {
         w.col(&ix.attrs)?;
         w.col(&ix.rec)?;
         w.col(&ix.vol)?;
+        if version >= FIRST_VERSION_WITH_RECYCLE {
+            w.col(&ix.orig_ids)?;
+            w.col(&ix.orig_off)?;
+            w.col(&ix.orig_names)?;
+        }
         let sum = w.h.0;
         w.w.write_all(&sum.to_le_bytes())?;
         let f = w.w.into_inner().map_err(|e| e.into_error())?;
@@ -173,6 +186,11 @@ pub fn load(path: &Path) -> io::Result<Index> {
         let root_entry = r.u32()?;
         volumes.push(VolumeInfo { root, meta: VolumeMeta { kind, serial, journal_id, next_usn }, root_entry });
     }
+    let has_recycle = ver >= FIRST_VERSION_WITH_RECYCLE;
+    if !has_recycle {
+        // A journal id never equals 0: the cursor is refused → volume rescan.
+        volumes.iter_mut().for_each(|v: &mut VolumeInfo| v.meta.journal_id = 0);
+    }
     let ix = Index {
         volumes,
         names: r.col(file_len)?,
@@ -186,6 +204,9 @@ pub fn load(path: &Path) -> io::Result<Index> {
         attrs: r.col(n)?,
         rec: r.col(n)?,
         vol: r.col(n)?,
+        orig_ids: if has_recycle { r.col(n)? } else { Vec::new() },
+        orig_off: if has_recycle { r.col(n + 1)? } else { vec![0] },
+        orig_names: if has_recycle { r.col(file_len)? } else { Vec::new() },
         dir_topo: Default::default(),
         dir_sizes: Default::default(),
     };
@@ -241,6 +262,16 @@ pub fn validate(ix: &Index) -> io::Result<()> {
     if ix.volumes.iter().any(|v| v.root_entry as usize >= n) {
         return Err(bad("root entry"));
     }
+    let k = ix.orig_ids.len();
+    if ix.orig_off.len() != k + 1 || ix.orig_off[0] != 0 || ix.orig_off[k] as usize != ix.orig_names.len() {
+        return Err(bad("orig_off bounds"));
+    }
+    let rows_ok = ix.orig_ids.windows(2).all(|w| w[0] < w[1])
+        && ix.orig_ids.last().is_none_or(|&i| (i as usize) < n)
+        && ix.orig_off.windows(2).all(|w| w[0] <= w[1] && std::str::from_utf8(&ix.orig_names[w[0] as usize..w[1] as usize]).is_ok());
+    if !rows_ok {
+        return Err(bad("recycle table"));
+    }
     Ok(())
 }
 
@@ -249,7 +280,8 @@ mod tests {
     use super::*;
     #[test]
     fn roundtrip_and_tamper() {
-        let ix = crate::index::tests::sample();
+        let ix = crate::index::build(vec![crate::index::tests::recycle_scan()]);
+        assert!(!ix.orig_ids.is_empty());
         // Stay inside the project tree (portability rule: no %TEMP%).
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/test-tmp")
@@ -262,10 +294,39 @@ mod tests {
         assert_eq!(ld.folded_off, ix.folded_off);
         assert_eq!(ld.parent, ix.parent);
         assert_eq!(ld.volumes, ix.volumes);
+        assert_eq!(ld.orig_ids, ix.orig_ids);
+        assert_eq!(ld.orig_off, ix.orig_off);
+        assert_eq!(ld.orig_names, ix.orig_names);
         let mut b = std::fs::read(&p).unwrap();
         let k = b.len() / 2;
         b[k] ^= 0x55;
         std::fs::write(&p, &b).unwrap();
+        assert!(load(&p).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v4_file_loads_with_cursors_reset() {
+        let mut scan = crate::index::tests::recycle_scan();
+        scan.meta = VolumeMeta { kind: ScanKind::Mft, serial: 1, journal_id: 77, next_usn: 5 };
+        let ix = crate::index::build(vec![scan]);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("usdb_v4_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.usdb");
+        save_version(&ix, &p, 4).unwrap();
+        let ld = load(&p).unwrap();
+        assert_eq!(ld.names, ix.names);
+        assert!(ld.orig_ids.is_empty());
+        assert_eq!(ld.volumes[0].meta.journal_id, 0);
+        assert_eq!(ld.volumes[0].meta.kind, ScanKind::Mft);
+        // Saved again as v5, it round-trips with the cursor still refused.
+        save(&ld, &p).unwrap();
+        let again = load(&p).unwrap();
+        assert_eq!(again.volumes[0].meta.journal_id, 0);
+        assert_eq!(again.names, ix.names);
+        save_version(&ix, &p, 3).unwrap();
         assert!(load(&p).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

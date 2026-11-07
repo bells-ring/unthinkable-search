@@ -2,7 +2,7 @@
 //! as UNTRUSTED (a malicious USB stick can contain any bytes): every offset and
 //! length is bounds-checked; corrupted records are skipped, never panic.
 
-use crate::scan::{NONE, ScanEntry, VolumeMeta, VolumeScan, ATTR_DIRECTORY};
+use crate::scan::{recycle_original_name, NONE, ScanEntry, VolumeMeta, VolumeScan, ATTR_DIRECTORY};
 
 /// NTFS applies the update-sequence fixup every 512 bytes regardless of the
 /// physical sector size.
@@ -239,6 +239,8 @@ fn push_utf16(arena: &mut Vec<u8>, b: &[u8]) {
 pub const R_IN_USE: u8 = 1;
 pub const R_DIR: u8 = 2;
 pub const R_HAS_SIZE: u8 = 4;
+/// Has a row in `MftChunk::recycle`.
+pub const R_RECYCLE_INFO: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MftRec {
@@ -269,6 +271,9 @@ pub struct MftChunk {
     pub arena: Vec<u8>,
     /// Sizes found in extension records: (base record, size).
     pub ext_sizes: Vec<(u32, u64)>,
+    /// Recycle Bin `$I…` files (small enough to live inside the record, which
+    /// spares us opening them): (record, original item name).
+    pub recycle: Vec<(u32, String)>,
 }
 
 const REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -283,6 +288,7 @@ pub fn parse_chunk(buf: &mut [u8], first: u64, rsize: usize) -> MftChunk {
         names: Vec::with_capacity(count),
         arena: Vec::with_capacity(count * 16),
         ext_sizes: Vec::new(),
+        recycle: Vec::new(),
     };
     for (i, rec) in buf.chunks_exact_mut(rsize).enumerate() {
         let recno = first + i as u64;
@@ -307,6 +313,9 @@ fn parse_record(rec: &[u8], h: &RecHeader, recno: u32, r: &mut MftRec, out: &mut
     }
     let owner = if is_ext { base as u32 } else { recno };
     let mut got_size = false;
+    // Attributes are stored by type: $FILE_NAME always precedes $DATA.
+    let mut maybe_info = false;
+    let mut has_info = false;
     for a in attrs(rec, h) {
         match a.ty {
             AT_STANDARD_INFORMATION if !is_ext => {
@@ -322,6 +331,7 @@ fn parse_record(rec: &[u8], h: &RecHeader, recno: u32, r: &mut MftRec, out: &mut
                 if parent > u32::MAX as u64 || fname.name16.is_empty() {
                     continue;
                 }
+                maybe_info |= fname.name16.starts_with(&[b'$', 0, b'I', 0]);
                 let off = out.arena.len();
                 push_utf16(&mut out.arena, fname.name16);
                 out.names.push(MftName {
@@ -342,6 +352,12 @@ fn parse_record(rec: &[u8], h: &RecHeader, recno: u32, r: &mut MftRec, out: &mut
                         r.size = sz;
                     }
                 }
+                if maybe_info && !is_ext
+                    && let Some(orig) = a.resident_value().and_then(recycle_original_name)
+                {
+                    out.recycle.push((owner, orig));
+                    has_info = true;
+                }
             }
             _ => {}
         }
@@ -350,7 +366,8 @@ fn parse_record(rec: &[u8], h: &RecHeader, recno: u32, r: &mut MftRec, out: &mut
         r.seq = h.seq;
         r.flags = R_IN_USE
             | if h.flags & REC_DIRECTORY != 0 { R_DIR } else { 0 }
-            | if got_size { R_HAS_SIZE } else { 0 };
+            | if got_size { R_HAS_SIZE } else { 0 }
+            | if has_info { R_RECYCLE_INFO } else { 0 };
     }
 }
 
@@ -386,7 +403,8 @@ pub fn record_state(rec: &mut [u8], recno: u32) -> Option<Option<crate::live::Re
             }
         }
     }
-    Some(Some(crate::live::RecState { is_dir, attrs: r.attrs, mtime: r.mtime, ctime: r.ctime, size: r.size, names }))
+    let orig_name = chunk.recycle.pop().map(|x| x.1);
+    Some(Some(crate::live::RecState { is_dir, attrs: r.attrs, mtime: r.mtime, ctime: r.ctime, size: r.size, names, orig_name }))
 }
 
 #[inline]
@@ -405,6 +423,7 @@ pub fn assemble(root: &str, meta: VolumeMeta, total: usize, chunks: Vec<MftChunk
     let mut names: Vec<MftName> = Vec::with_capacity(chunks.iter().map(|c| c.names.len()).sum());
     let mut arena: Vec<u8> = Vec::with_capacity(chunks.iter().map(|c| c.arena.len()).sum());
     let mut ext_sizes = Vec::new();
+    let mut infos = std::collections::HashMap::new();
     for c in chunks {
         let f = c.first as usize;
         if f < total {
@@ -418,6 +437,7 @@ pub fn assemble(root: &str, meta: VolumeMeta, total: usize, chunks: Vec<MftChunk
             n
         }));
         ext_sizes.extend(c.ext_sizes);
+        infos.extend(c.recycle);
     }
     for (b, sz) in ext_sizes {
         if let Some(r) = recs.get_mut(b as usize) {
@@ -534,7 +554,12 @@ pub fn assemble(root: &str, meta: VolumeMeta, total: usize, chunks: Vec<MftChunk
         if p >= total || state[p] != OK || !parent_ok(n, &recs) {
             continue;
         }
-        push(&mut scan, n, &rr, false);
+        let id = push(&mut scan, n, &rr, false);
+        if rr.flags & R_RECYCLE_INFO != 0
+            && let Some(orig) = infos.get(&n.rec)
+        {
+            scan.recycle.push((id, orig.clone()));
+        }
     }
     for e in scan.entries.iter_mut().skip(1) {
         e.parent = dir_local[e.parent as usize];
@@ -700,6 +725,36 @@ pub mod tests {
             ]
         );
         assert_eq!(s.entries[0].attrs & ATTR_DIRECTORY, ATTR_DIRECTORY);
+    }
+
+    #[test]
+    fn recycle_bin_records() {
+        let dir = REC_IN_USE | REC_DIRECTORY;
+        let info = crate::index::tests::info_v2(r"D:\Мои документы\Отчёт.txt");
+        let data = resident(AT_DATA, 0, &info);
+        let i_rec = make_record(1, REC_IN_USE, 0, &[std_info(1, 0x20), file_name(41, 1, NS_WIN32, "$IABC123.txt"), data.clone()]);
+        let recs = vec![
+            (5, make_record(5, dir, 0, &[std_info(1, 0x16), file_name(5, 5, NS_WIN32_DOS, ".")])),
+            (40, make_record(1, dir, 0, &[std_info(1, 0), file_name(5, 5, NS_WIN32, "$Recycle.Bin")])),
+            (41, make_record(1, dir, 0, &[std_info(1, 0), file_name(40, 1, NS_WIN32, "S-1-5-21-1")])),
+            (42, i_rec.clone()),
+            (43, make_record(1, REC_IN_USE, 0, &[std_info(1, 0x20), file_name(41, 1, NS_WIN32, "$RABC123.txt"), nonres_data(99)])),
+            // `$I` contents in a file with another name are never parsed.
+            (44, make_record(1, REC_IN_USE, 0, &[std_info(1, 0x20), file_name(5, 5, NS_WIN32, "plain.txt"), data])),
+        ];
+        let s = volume(recs, 50);
+        assert_eq!(s.recycle.len(), 1);
+        let ix = crate::index::build(vec![s]);
+        let item = (0..ix.len() as u32).find(|&i| ix.name(i) == "$RABC123.txt").unwrap();
+        assert_eq!(ix.display_name(item), "Отчёт.txt");
+        assert_eq!(ix.folded_name(item), "отчет.txt".as_bytes());
+        let mut p = String::new();
+        ix.full_path_into(item, &mut p);
+        assert_eq!(p, r"T:\$Recycle.Bin\S-1-5-21-1\$RABC123.txt");
+        // The on-demand path used by live updates reads the same data.
+        let mut r = i_rec;
+        let st = record_state(&mut r, 42).unwrap().unwrap();
+        assert_eq!(st.orig_name.as_deref(), Some("Отчёт.txt"));
     }
 
     #[test]

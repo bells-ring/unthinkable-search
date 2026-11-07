@@ -23,6 +23,8 @@ pub struct RecState {
     pub size: u64,
     /// (parent record, name). Directories: exactly one name. Files: one per hard link.
     pub names: Vec<(u32, String)>,
+    /// Contents of a Recycle Bin `$I…` file: the original item name.
+    pub orig_name: Option<String>,
 }
 
 /// Latest known state per changed record of ONE volume (`None` = deleted / not in use).
@@ -124,6 +126,7 @@ fn copy_volume(ix: &Index, v: usize, ents: &[u32], meta: VolumeMeta) -> VolumeSc
         let id = s.push_rec(ix.parent[iu], ix.name(i), ix.attrs[iu], ix.size[iu], ix.mtime[iu], ix.ctime[iu], ix.rec[iu]);
         local.insert(i, id);
     }
+    s.recycle = ix.recycle_infos(v).filter_map(|(i, o)| Some((*local.get(&i)?, o.to_string()))).collect();
     let mut keep = vec![true; s.entries.len()];
     for (k, e) in s.entries.iter_mut().enumerate().skip(1) {
         match local.get(&e.parent) {
@@ -157,6 +160,7 @@ fn compact_orphans(s: VolumeScan, keep: &[bool]) -> VolumeScan {
             }
         }
     }
+    out.recycle = s.recycle.iter().filter_map(|(id, o)| map.get(*id as usize).filter(|&&m| m != NONE).map(|&m| (m, o.clone()))).collect();
     out
 }
 
@@ -217,6 +221,9 @@ fn rebuild_volume(ix: &Index, v: usize, ents: &[u32], ch: &Changes, meta: Volume
     for it in &items {
         max_rec = max_rec.max(it.parent_rec as usize + 1);
     }
+    // Recycle Bin metadata per record: the new state wins over the snapshot.
+    let mut infos: HashMap<u32, &str> = ix.recycle_infos(v).map(|(i, o)| (ix.rec[i as usize], o)).filter(|(r, _)| !ch.contains_key(r)).collect();
+    infos.extend(ch.iter().filter_map(|(&r, st)| Some((r, st.as_ref()?.orig_name.as_deref()?))));
 
     // Directory record → its item.
     let mut dir_item = vec![NONE; max_rec];
@@ -282,7 +289,12 @@ fn rebuild_volume(ix: &Index, v: usize, ents: &[u32], ch: &Changes, meta: Volume
         if is_dir || state[it.parent_rec as usize] != OK {
             continue;
         }
-        s.push_rec(it.parent_rec, name(it), it.attrs, it.size, it.mtime, it.ctime, it.rec);
+        let id = s.push_rec(it.parent_rec, name(it), it.attrs, it.size, it.mtime, it.ctime, it.rec);
+        if !infos.is_empty() && name(it).starts_with("$I")
+            && let Some(o) = infos.get(&it.rec)
+        {
+            s.recycle.push((id, o.to_string()));
+        }
     }
     for e in s.entries.iter_mut().skip(1) {
         e.parent = dir_local[e.parent as usize];
@@ -326,7 +338,7 @@ mod tests {
     fn create_rename_move_delete() {
         let ix = mft_index();
         let st = |is_dir, names: Vec<(u32, &str)>| {
-            Some(RecState { is_dir, attrs: 0, mtime: 9, ctime: 8, size: 7, names: names.into_iter().map(|(p, n)| (p, n.to_string())).collect() })
+            Some(RecState { is_dir, attrs: 0, mtime: 9, ctime: 8, size: 7, names: names.into_iter().map(|(p, n)| (p, n.to_string())).collect(), orig_name: None })
         };
         let mut ch = Changes::new();
         ch.insert(31, st(true, vec![(5, "moved")])); // move+rename dir: docs\sub -> \moved
@@ -348,6 +360,51 @@ mod tests {
         let nx2 = apply(&nx, &[ch], &[]);
         assert!(paths(&nx2, "top.bin").is_empty());
         assert_eq!(paths(&nx2, "link"), vec!["T:\\link.bin"]);
+    }
+
+    /// `T:\$Recycle.Bin\SID`: bin = record 50, sid = record 51.
+    fn bin_index() -> Index {
+        let mut s = VolumeScan::new("T:");
+        s.entries[0].rec = 5;
+        let bin = s.push_rec(0, "$Recycle.Bin", ATTR_DIRECTORY, 0, 0, 0, 50);
+        s.push_rec(bin, "SID", ATTR_DIRECTORY, 0, 0, 0, 51);
+        s.push_rec(0, "report.txt", 0, 1, 0, 0, 60);
+        s.push_rec(0, "other.txt", 0, 1, 0, 0, 70);
+        build(vec![s])
+    }
+
+    fn file(parent: u32, name: &str, orig: Option<&str>) -> Option<RecState> {
+        Some(RecState { is_dir: false, attrs: 0, mtime: 1, ctime: 1, size: 1, names: vec![(parent, name.to_string())], orig_name: orig.map(str::to_string) })
+    }
+
+    #[test]
+    fn recycle_delete_and_restore_through_live_updates() {
+        let sid = r"T:\$Recycle.Bin\SID";
+        let ix = bin_index();
+        // Explorer writes `$I` first; the item is renamed in a later batch.
+        let mut ch = Changes::new();
+        ch.insert(61, file(51, "$IAAAAAA.txt", Some("report.txt")));
+        let ix = apply(&ix, &[ch], &[]);
+        assert_eq!(paths(&ix, "report.txt"), vec![r"T:\report.txt"]);
+        let mut ch = Changes::new();
+        ch.insert(60, file(51, "$RAAAAAA.txt", None));
+        let ix = apply(&ix, &[ch], &[]);
+        assert_eq!(paths(&ix, "report.txt"), vec![format!(r"{sid}\$RAAAAAA.txt")]);
+        // Unrelated changes (the same volume and another one) keep the link.
+        let mut ch = Changes::new();
+        ch.insert(70, file(5, "renamed.txt", None));
+        let ix = apply(&ix, &[ch], &[]);
+        assert_eq!(paths(&ix, "report.txt"), vec![format!(r"{sid}\$RAAAAAA.txt")]);
+        let ix = apply(&ix, &[], &[]);
+        assert_eq!(paths(&ix, "report.txt"), vec![format!(r"{sid}\$RAAAAAA.txt")]);
+        crate::store::validate(&ix).unwrap();
+        // Restore: `$I` removed, the item is back under its own name.
+        let mut ch = Changes::new();
+        ch.insert(61, None);
+        ch.insert(60, file(5, "report.txt", None));
+        let ix = apply(&ix, &[ch], &[]);
+        assert_eq!(paths(&ix, "report.txt"), vec![r"T:\report.txt"]);
+        assert!(ix.orig_ids.is_empty());
     }
 
     #[test]

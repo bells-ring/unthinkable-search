@@ -294,11 +294,11 @@ pub unsafe extern "C" fn us_results_full_path(r: *const UsResults, i: u32, buf: 
     unsafe { put_str(&s, buf, cap) }
 }
 
-/// Name of item `i`.
+/// Name of item `i` (the original name for an item in the Recycle Bin).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn us_results_name(r: *const UsResults, i: u32, buf: *mut c_char, cap: usize) -> usize {
     let Some((r, id)) = item(r, i) else { return unsafe { put_str("", buf, cap) } };
-    unsafe { put_str(r.ix.name(id), buf, cap) }
+    unsafe { put_str(r.ix.display_name(id), buf, cap) }
 }
 
 /// Containing folder of item `i` (empty for a volume root).

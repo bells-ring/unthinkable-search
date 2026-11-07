@@ -1,14 +1,21 @@
 //! USN change journal: which MFT records changed since a cursor, and their new
 //! state fetched straight from the MFT (`FSCTL_GET_NTFS_FILE_RECORD`).
 //!
-//! We never open the changed files themselves: no OneDrive hydration, no
-//! last-access updates, no antivirus scans triggered, exact size/mtime.
+//! We never open the changed files themselves (except Recycle Bin metadata, see
+//! `fetch`): no OneDrive hydration, no last-access updates, no antivirus scans
+//! triggered, exact size/mtime.
 
 use crate::mft::{open_volume, query_usn, volume_data};
 use crate::util::{last_err, Handle};
 use std::io;
 use us_core::live::RecState;
 use us_core::ntfs;
+use us_core::scan::{is_recycle_info_name, recycle_original_name, RECYCLE_INFO_MAX};
+use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{
+    FileIdType, OpenFileById, ReadFile, FILE_FLAG_OPEN_NO_RECALL, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
+};
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_NTFS_FILE_RECORD, FSCTL_READ_USN_JOURNAL};
 
@@ -163,6 +170,40 @@ impl Journal {
         }
         let len = (u32::from_le_bytes(self.rec_buf[8..12].try_into().unwrap()) as usize).min(got - 12).min(self.rsize);
         let r = &mut self.rec_buf[12..12 + len];
-        Ok(ntfs::record_state(r, rec).flatten())
+        let seq = ntfs::u16le(r, 0x10).unwrap_or(0);
+        let mut st = ntfs::record_state(r, rec).flatten();
+        // A `$I…` file just written by Explorer may not be flushed to its record
+        // yet (and a very long path is not stored there at all). It is the only
+        // file we ever open here, through the cache, by id.
+        if let Some(s) = &mut st
+            && !s.is_dir
+            && s.orig_name.is_none()
+            && s.names.iter().any(|(_, n)| is_recycle_info_name(n))
+        {
+            s.orig_name = self.read_by_id(rec, seq).and_then(|data| recycle_original_name(&data));
+        }
+        Ok(st)
+    }
+
+    fn read_by_id(&self, rec: u32, seq: u16) -> Option<Vec<u8>> {
+        let id = FILE_ID_DESCRIPTOR {
+            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: FileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: ((seq as i64) << 48) | rec as i64 },
+        };
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let h = unsafe { OpenFileById(self.h.0, &id, GENERIC_READ, share, std::ptr::null(), FILE_FLAG_OPEN_NO_RECALL) };
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
+            return None;
+        }
+        let h = Handle(h);
+        let mut buf = vec![0u8; RECYCLE_INFO_MAX];
+        let mut got = 0u32;
+        let ok = unsafe { ReadFile(h.0, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null_mut()) };
+        if ok == 0 {
+            return None;
+        }
+        buf.truncate(got as usize);
+        Some(buf)
     }
 }

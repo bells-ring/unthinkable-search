@@ -177,7 +177,7 @@ pub fn json_item(out: &mut String, ix: &Index, id: u32, fields: &[Field], tf: Ti
                 ix.full_path_into(id, scratch);
                 json_str(out, scratch);
             }
-            Field::Name => json_str(out, ix.name(id)),
+            Field::Name => json_str(out, ix.display_name(id)),
             Field::Path => {
                 ix.dir_path_into(id, scratch);
                 json_str(out, scratch);
@@ -203,7 +203,7 @@ pub fn cell(ix: &Index, id: u32, f: Field, tf: TimeFormat, scratch: &mut String)
             ix.full_path_into(id, scratch);
             scratch.clone()
         }
-        Field::Name => ix.name(id).to_string(),
+        Field::Name => ix.display_name(id).to_string(),
         Field::Path => {
             ix.dir_path_into(id, scratch);
             scratch.clone()

@@ -68,7 +68,8 @@ All files the program writes go into `data\` next to the exe. Checksums are in `
 
 ## Features
 
-* **Search window.** Global hotkey Ctrl+Alt+F, results update as you type. Columns for name, path, size (recursive for folders), modified and created dates, sortable. The Explorer context menu (Shift for the extended one), Del, Shift+Del, Ctrl+C, Ctrl+X, Ctrl+Shift+C to copy the path, F2 to rename, Alt+Enter for properties.
+* **Search window.** Global hotkey Ctrl+Alt+F, results update as you type. Columns for name, path, size (recursive for folders), modified and created dates, sortable. The Explorer context menu (Shift for the extended one), Del, Shift+Del, Ctrl+C, Ctrl+X, Ctrl+Shift+C to copy the path, F2 to rename, Alt+Enter for properties. Ctrl+A and Ctrl+Backspace work in text fields.
+* **Recycle Bin.** Deleted items are found by their original names, although Windows keeps them on disk as `$R…`.
 * **Query language.** `foo bar` is AND, `a|b` is OR, `!x` is NOT, `*.pdf` and `a?c` are wildcards, `ext:pdf;docx` filters by extension, `file:` and `folder:` filter by type, `windows\system32` searches the full path. Case and diacritics are ignored (`é` matches `e`, `ё` matches `е`).
 * **Live updates.** Create, rename, move and delete show up in results within a fraction of a second.
 * **Embeddable.** `usc search --format json|jsonl|tsv|csv|nul`, a JSON lines server on stdin/stdout or a named pipe, a C ABI DLL with wrappers for C# and Python, and Rust crates. See [docs/INTEGRATION.md](docs/INTEGRATION.md) (currently in Russian).

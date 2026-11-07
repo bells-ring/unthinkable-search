@@ -93,6 +93,11 @@ fn enc_scan(s: &VolumeScan) -> Vec<u8> {
         e.u32(x.rec);
     }
     e.bytes(&s.arena);
+    e.u32(s.recycle.len() as u32);
+    for (id, orig) in &s.recycle {
+        e.u32(*id);
+        e.bytes(orig.as_bytes());
+    }
     e.0
 }
 
@@ -128,7 +133,19 @@ fn dec_scan(b: &[u8]) -> Option<VolumeScan> {
         std::str::from_utf8(arena.get(x.name_off as usize..end)?).ok()?;
         if i == 0 { if x.parent != NONE { return None } } else if x.parent as usize >= n { return None }
     }
-    Some(VolumeScan { root, meta, entries, arena })
+    let k = d.u32()? as usize;
+    if k > b.len() {
+        return None;
+    }
+    let mut recycle = Vec::with_capacity(k);
+    for _ in 0..k {
+        let id = d.u32()?;
+        if id as usize >= n {
+            return None;
+        }
+        recycle.push((id, d.str()?));
+    }
+    Some(VolumeScan { root, meta, entries, arena, recycle })
 }
 
 fn enc_changes(vol: char, id: u64, usn: i64, items: &[(u32, Option<RecState>)]) -> Vec<u8> {
@@ -153,6 +170,7 @@ fn enc_changes(vol: char, id: u64, usn: i64, items: &[(u32, Option<RecState>)]) 
                     e.u32(*p);
                     e.bytes(n.as_bytes());
                 }
+                e.bytes(s.orig_name.as_deref().unwrap_or("").as_bytes());
             }
         }
     }
@@ -190,7 +208,8 @@ fn dec_changes(b: &[u8]) -> Option<ChangeMsg> {
                     let p = d.u32()?;
                     names.push((p, d.str()?));
                 }
-                Some(RecState { is_dir, attrs, mtime, ctime, size, names })
+                let orig_name = Some(d.str()?).filter(|o| !o.is_empty());
+                Some(RecState { is_dir, attrs, mtime, ctime, size, names, orig_name })
             }
         };
         items.push((r, st));
@@ -564,10 +583,12 @@ mod tests {
         s.meta = VolumeMeta { kind: ScanKind::Mft, serial: 7, journal_id: 9, next_usn: 11 };
         let d = s.push_rec(0, "dir", 0x10, 0, 1, 0, 30);
         s.push_rec(d, "файл.txt", 0, 5, 2, 0, 31);
+        s.recycle.push((2, "исходное.txt".into()));
         let b = enc_scan(&s);
         let r = dec_scan(&b).unwrap();
         assert_eq!(r.meta, s.meta);
         assert_eq!(r.name(2), "файл.txt");
+        assert_eq!(r.recycle, s.recycle);
         assert_eq!(r.entries[2].parent, d);
         // Truncations and bit flips must never panic and never yield a scan
         // whose names/parents are out of bounds.
@@ -587,7 +608,11 @@ mod tests {
 
     #[test]
     fn changes_roundtrip() {
-        let items = vec![(5u32, None), (6, Some(RecState { is_dir: false, attrs: 1, mtime: 2, ctime: 4, size: 3, names: vec![(5, "ä.txt".into())] }))];
+        let items = vec![
+            (5u32, None),
+            (6, Some(RecState { is_dir: false, attrs: 1, mtime: 2, ctime: 4, size: 3, names: vec![(5, "ä.txt".into())], orig_name: None })),
+            (7, Some(RecState { is_dir: false, attrs: 1, mtime: 2, ctime: 4, size: 3, names: vec![(5, "$IABC123".into())], orig_name: Some("б".into()) })),
+        ];
         let b = enc_changes('D', 1, 2, &items);
         let (v, id, usn, it) = dec_changes(&b).unwrap();
         assert_eq!((v, id, usn), ('D', 1, 2));

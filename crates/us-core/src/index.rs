@@ -34,6 +34,14 @@ pub struct Index {
     pub rec: Vec<u32>,
     /// Volume index (into `volumes`) of each entry.
     pub vol: Vec<u8>,
+    /// Recycle Bin table, sorted by entry id. `names` always holds the on-disk
+    /// name (paths must stay real), `folded` the name people search for. A row
+    /// is either a `$R…` item (its original name) or the `$I…` file it came from
+    /// (the source of truth that survives rebuilds).
+    pub orig_ids: Vec<u32>,
+    /// `orig_names` offsets, `orig_ids.len() + 1` of them.
+    pub orig_off: Vec<u32>,
+    pub orig_names: Vec<u8>,
     /// Lazily computed directory topology (only built on the first path query).
     pub dir_topo: std::sync::OnceLock<DirTopo>,
     /// Lazily computed recursive directory sizes (indexed by `DirTopo` slot).
@@ -50,12 +58,39 @@ impl Index {
         self.parent.is_empty()
     }
 
+    /// On-disk name (`$R123456.txt` for an item in the Recycle Bin).
     #[inline]
     pub fn name(&self, i: u32) -> &str {
         let i = i as usize;
         let b = &self.names[self.names_off[i] as usize..self.names_off[i + 1] as usize];
         // Names are written only from &str and validated on load.
         unsafe { std::str::from_utf8_unchecked(b) }
+    }
+
+    fn orig_row(&self, i: u32) -> Option<&str> {
+        let k = self.orig_ids.binary_search(&i).ok()?;
+        let b = &self.orig_names[self.orig_off[k] as usize..self.orig_off[k + 1] as usize];
+        // Validated on load.
+        Some(unsafe { std::str::from_utf8_unchecked(b) })
+    }
+
+    /// Name to show and match: the original name for a Recycle Bin item, the
+    /// on-disk name for all other entries.
+    #[inline]
+    pub fn display_name(&self, i: u32) -> &str {
+        let real = self.name(i);
+        if real.starts_with("$R") { self.orig_row(i).unwrap_or(real) } else { real }
+    }
+
+    /// Item in the Recycle Bin shown under its original name.
+    #[inline]
+    pub fn is_recycled(&self, i: u32) -> bool {
+        self.name(i).starts_with("$R") && self.orig_row(i).is_some()
+    }
+
+    /// `$I…` rows of volume `v`: (entry id, original name).
+    pub(crate) fn recycle_infos(&self, v: usize) -> impl Iterator<Item = (u32, &str)> {
+        self.orig_ids.iter().filter(move |&&i| self.vol[i as usize] as usize == v && self.name(i).starts_with("$I")).filter_map(|&i| Some((i, self.orig_row(i)?)))
     }
 
     #[inline]
@@ -135,6 +170,8 @@ impl Index {
             + 4 * self.attrs.capacity()
             + 4 * self.rec.capacity()
             + self.vol.capacity()
+            + 4 * (self.orig_ids.capacity() + self.orig_off.capacity())
+            + self.orig_names.capacity()
             + self.dir_topo.get().map_or(0, |t| 4 * (t.order.capacity() + t.slot.capacity() + t.pslot.capacity() + t.dpar.capacity() + t.end.capacity() + t.dname_off.capacity()) + t.dnames.capacity())
     }
 
@@ -297,6 +334,7 @@ pub fn build(scans: Vec<VolumeScan>) -> Index {
         n += s.entries.len();
     }
     assert!(n < NONE as usize, "too many entries");
+    let links: Vec<_> = scans.iter().map(|s| s.recycle_links()).collect();
 
     // 2. Fold all names in parallel (chunked), producing a temp blob in temp-id order.
     const CH: usize = 1 << 15;
@@ -313,11 +351,16 @@ pub fn build(scans: Vec<VolumeScan>) -> Index {
         .par_iter()
         .map(|&(si, st, en)| {
             let s = &scans[si];
+            let items = &links[si].items;
             let mut blob = Vec::with_capacity((en - st) * 24);
             let mut lens = Vec::with_capacity(en - st);
             for i in st..en {
                 let b0 = blob.len();
-                fold_into(s.name(i), &mut blob);
+                let mut name = s.name(i);
+                if !items.is_empty() && name.starts_with("$R") {
+                    name = items.get(&(i as u32)).copied().unwrap_or(name);
+                }
+                fold_into(name, &mut blob);
                 lens.push((blob.len() - b0) as u32);
             }
             (blob, lens)
@@ -410,6 +453,23 @@ pub fn build(scans: Vec<VolumeScan>) -> Index {
     names_off.push(names.len() as u32);
     folded_off.push(folded.len() as u32);
 
+    let mut orig: Vec<(u32, &str)> = Vec::new();
+    for (si, l) in links.iter().enumerate() {
+        let rows = l.items.iter().map(|(&id, &o)| (id, o)).chain(l.infos.iter().copied());
+        orig.extend(rows.map(|(id, o)| (inv[(base[si] + id) as usize], o)));
+    }
+    orig.sort_unstable_by_key(|r| r.0);
+    orig.dedup_by_key(|r| r.0);
+    let mut orig_ids = Vec::with_capacity(orig.len());
+    let mut orig_off = Vec::with_capacity(orig.len() + 1);
+    let mut orig_names = Vec::new();
+    for (id, o) in &orig {
+        orig_ids.push(*id);
+        orig_off.push(orig_names.len() as u32);
+        orig_names.extend_from_slice(o.as_bytes());
+    }
+    orig_off.push(orig_names.len() as u32);
+
     let volumes = scans
         .iter()
         .enumerate()
@@ -433,6 +493,9 @@ pub fn build(scans: Vec<VolumeScan>) -> Index {
         attrs,
         rec,
         vol,
+        orig_ids,
+        orig_off,
+        orig_names,
         dir_topo: Default::default(),
         dir_sizes: Default::default(),
     }
@@ -487,5 +550,103 @@ pub(crate) mod tests {
         let pr = ix.parent[notes as usize];
         ix.dir_path_into(pr, &mut p);
         assert_eq!(p, "D:");
+    }
+
+    /// `$I` contents in the v2 layout.
+    pub fn info_v2(path: &str) -> Vec<u8> {
+        let u: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut b = vec![0u8; 24];
+        b[0] = 2;
+        b.extend_from_slice(&(u.len() as u32).to_le_bytes());
+        b.extend(u.iter().flat_map(|c| c.to_le_bytes()));
+        b
+    }
+
+    #[test]
+    fn recycle_info_layouts_and_bad_input() {
+        use crate::scan::recycle_original_name as parse;
+        assert_eq!(parse(&info_v2(r"D:\yt-dlp\Отчёт.mp4.part")).as_deref(), Some("Отчёт.mp4.part"));
+        // v1: fixed buffer, NUL-terminated.
+        let mut v1 = vec![0u8; 24 + 520];
+        v1[0] = 1;
+        for (k, c) in r"C:\a\report.txt".encode_utf16().enumerate() {
+            v1[24 + 2 * k..26 + 2 * k].copy_from_slice(&c.to_le_bytes());
+        }
+        assert_eq!(parse(&v1).as_deref(), Some("report.txt"));
+        // Never panics on truncated input, rejects what could disguise a name.
+        let good = info_v2(r"C:\a\b.txt");
+        for cut in 0..good.len() {
+            let _ = parse(&good[..cut]);
+        }
+        let mut huge = good.clone();
+        huge[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse(&huge), None);
+        for bad in [r"C:\a\", r"C:\a\b:c.txt", "C:\\a\\x\u{202E}fdp.exe", "C:\\a\\x\ty.txt", r"C:\a\.."] {
+            assert_eq!(parse(&info_v2(bad)), None, "{bad}");
+        }
+        assert_eq!(parse(&[3u8; 64]), None);
+    }
+
+    pub fn recycle_scan() -> VolumeScan {
+        let mut c = VolumeScan::new("C:");
+        let bin = c.push(0, "$Recycle.Bin", D, 0, 1);
+        let sid = c.push(bin, "S-1-5-21-1", D, 0, 1);
+        let i = c.push(sid, "$IABC123.txt", 0, 100, 1);
+        c.recycle.push((i, "Отчёт за год.txt".into()));
+        c.push(sid, "$RABC123.txt", 0, 5000, 1);
+        // A deleted folder: its children keep their names.
+        let i = c.push(sid, "$IDIR456", 0, 100, 1);
+        c.recycle.push((i, "Проект.old".into()));
+        let d = c.push(sid, "$RDIR456", D, 0, 1);
+        c.push(d, "main.rs", 0, 7, 1);
+        // Extension spoofing: shown name must not hide an executable.
+        let i = c.push(sid, "$IEVIL78.exe", 0, 100, 1);
+        c.recycle.push((i, "invoice.pdf".into()));
+        c.push(sid, "$REVIL78.exe", 0, 1, 1);
+        // Metadata without an item (its `$R` was removed): nothing to show.
+        let i = c.push(sid, "$IGONE90.txt", 0, 100, 1);
+        c.recycle.push((i, "gone.txt".into()));
+        // The same shape outside a Recycle Bin is an ordinary pair of files.
+        let o = c.push(0, "other", D, 0, 1);
+        let i = c.push(o, "$IOUT000.txt", 0, 1, 1);
+        c.recycle.push((i, "fake.txt".into()));
+        c.push(o, "$ROUT000.txt", 0, 1, 1);
+        c
+    }
+
+    fn find(ix: &Index, folded: &str) -> Vec<String> {
+        let mut p = String::new();
+        (0..ix.len() as u32)
+            .filter(|&i| ix.folded_name(i) == folded.as_bytes())
+            .map(|i| {
+                ix.full_path_into(i, &mut p);
+                p.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recycled_items_are_found_by_original_name() {
+        let ix = build(vec![recycle_scan()]);
+        crate::store::validate(&ix).unwrap();
+        let sid = r"C:\$Recycle.Bin\S-1-5-21-1";
+        // Searchable and shown under the original name, opened by the real path.
+        assert_eq!(find(&ix, "отчет за год.txt"), vec![format!(r"{sid}\$RABC123.txt")]);
+        let i = (0..ix.len() as u32).find(|&i| ix.name(i) == "$RABC123.txt").unwrap();
+        assert_eq!(ix.display_name(i), "Отчёт за год.txt");
+        assert!(ix.is_recycled(i));
+        // Folder: original name; children still resolve through the real one.
+        assert_eq!(find(&ix, "проект.old"), vec![format!(r"{sid}\$RDIR456")]);
+        assert_eq!(find(&ix, "main.rs"), vec![format!(r"{sid}\$RDIR456\main.rs")]);
+        // Metadata files, spoofed extensions and look-alikes keep their names.
+        assert_eq!(find(&ix, "$iabc123.txt").len(), 1);
+        assert!(find(&ix, "invoice.pdf").is_empty());
+        assert_eq!(find(&ix, "$revil78.exe").len(), 1);
+        assert!(find(&ix, "gone.txt").is_empty());
+        assert!(find(&ix, "fake.txt").is_empty());
+        assert_eq!(find(&ix, "$rout000.txt"), vec![r"C:\other\$ROUT000.txt"]);
+        let plain = (0..ix.len() as u32).find(|&i| ix.name(i) == "main.rs").unwrap();
+        assert_eq!(ix.display_name(plain), "main.rs");
+        assert!(!ix.is_recycled(plain));
     }
 }

@@ -6,6 +6,8 @@
 //!
 //! Keys: type to search · ↓/↑ move · Enter open · Ctrl+Enter open folder ·
 //! Esc hide · Ctrl+Alt+F global show/hide · Ctrl+Q / close button exit.
+//! In text fields (search box, inline rename): Ctrl+A select all ·
+//! Ctrl+Backspace delete word (a bare EDIT control has neither).
 //! In the list: right click / Shift+F10 / menu key = Explorer context menu
 //! (Shift = extended verbs) · Del / Shift+Del delete · Ctrl+C / Ctrl+X copy /
 //! cut files · Ctrl+Shift+C copy full path · F2 rename · Alt+Enter properties ·
@@ -215,7 +217,7 @@ fn cell_text(app: &App, row: usize, col: i32) -> String {
     let Some(&id) = r.ids.get(row) else { return String::new() };
     let ix = &r.ix;
     match col as usize {
-        COL_NAME => ix.name(id).to_string(),
+        COL_NAME => ix.display_name(id).to_string(),
         COL_PATH => {
             let mut s = String::new();
             ix.dir_path_into(id, &mut s);
@@ -305,7 +307,7 @@ fn selection_info(app: &App) -> Option<String> {
         let kind = if ix.is_dir(id) { "папка" } else { "файл" };
         Some(format!(
             "{} · {kind} · {} · изменён {} · создан {}",
-            ix.name(id),
+            ix.display_name(id),
             fmt_size_long(ix.total_size(id)),
             fmt_time(ix.mtime[id as usize]),
             fmt_time(ix.ctime[id as usize]),
@@ -353,6 +355,13 @@ fn copy_paths(hwnd: HWND) {
 /// Start inline renaming of `row`. The path is captured now: results may be
 /// replaced by a live update while the user is typing.
 fn begin_rename(row: usize) {
+    // The row shows the original name, the file is `$R…`: renaming it would
+    // break the link with `$I…`, and the Recycle Bin could no longer restore it.
+    let recycled = with_app(|a| a.res.as_ref().and_then(|r| r.ids.get(row).map(|&id| r.ix.is_recycled(id)))).flatten();
+    if recycled == Some(true) {
+        flash_status("Объект в Корзине нельзя переименовать: сначала восстановите его");
+        return;
+    }
     let Some(Some((list, path))) = with_app(|a| row_path(a, row).map(|p| (a.list, p))) else { return };
     RENAME_PATH.with(|p| *p.borrow_mut() = Some(path));
     RENAME_ARMED.set(true);
@@ -682,12 +691,62 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+/// Start of the word to the left of `caret` (UTF-16 units, like an EDIT control):
+/// spaces, then one run of word characters or of punctuation.
+fn word_left(text: &[u16], caret: usize) -> usize {
+    #[derive(PartialEq)]
+    enum Class {
+        Space,
+        Word,
+        Other,
+    }
+    let class = |u: u16| match char::from_u32(u as u32) {
+        Some(c) if c.is_whitespace() => Class::Space,
+        Some(c) if !c.is_alphanumeric() && c != '_' => Class::Other,
+        _ => Class::Word, // letters, digits and surrogates (astral characters)
+    };
+    let mut k = caret.min(text.len());
+    while k > 0 && class(text[k - 1]) == Class::Space {
+        k -= 1;
+    }
+    if k > 0 {
+        let c = class(text[k - 1]);
+        while k > 0 && class(text[k - 1]) == c {
+            k -= 1;
+        }
+    }
+    k
+}
+
+/// Ctrl+Backspace. Unhandled, it reaches the control as the DEL character (0x7F)
+/// and silently becomes part of the query.
+fn delete_word_left(edit: HWND) {
+    unsafe {
+        let (mut start, mut end) = (0u32, 0u32);
+        SendMessageW(edit, EM_GETSEL as u32, &mut start as *mut u32 as usize, &mut end as *mut u32 as isize);
+        if start == end {
+            let len = GetWindowTextLengthW(edit) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let n = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+            start = word_left(&buf[..n], end as usize) as u32;
+            if start == end {
+                return;
+            }
+            SendMessageW(edit, EM_SETSEL as u32, start as usize, end as isize);
+        }
+        // Undoable; notifies EN_CHANGE, so the search box re-runs the query.
+        SendMessageW(edit, EM_REPLACESEL as u32, 1, w("").as_ptr() as isize);
+    }
+}
+
 /// Keyboard shortcuts handled before dispatch. Returns true if consumed.
 fn pre_translate(msg: &MSG) -> bool {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return false;
     }
-    let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+    // AltGr arrives as Ctrl+Alt: it types characters (`@` is AltGr+Q on some
+    // layouts) and must not trigger Ctrl shortcuts.
+    let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_MENU as i32) >= 0 };
     let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
     let alt = msg.message == WM_SYSKEYDOWN;
     let vk = msg.wParam as u16;
@@ -704,6 +763,21 @@ fn pre_translate(msg: &MSG) -> bool {
     let consumed = with_app(|a| {
         let in_edit = msg.hwnd == a.edit;
         let in_list = msg.hwnd == a.list;
+        // Search box or the inline rename control.
+        let in_text = in_edit || (!in_list && !msg.hwnd.is_null() && msg.hwnd == unsafe { SendMessageW(a.list, LVM_GETEDITCONTROL, 0, 0) } as HWND);
+        if in_text && ctrl && !alt {
+            match vk {
+                0x41 if !shift => {
+                    unsafe { SendMessageW(msg.hwnd, EM_SETSEL as u32, 0, -1) };
+                    return true;
+                }
+                VK_BACK => {
+                    delete_word_left(msg.hwnd);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if !(in_edit || in_list) {
             return false;
         }
@@ -958,4 +1032,27 @@ pub fn run_with(args: &[String]) -> i32 {
 
 pub fn run() -> i32 {
     run_with(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_left;
+
+    #[test]
+    fn word_left_stops_at_word_boundaries() {
+        let at = |s: &str, caret: usize| word_left(&s.encode_utf16().collect::<Vec<_>>(), caret);
+        assert_eq!(at("", 0), 0);
+        assert_eq!(at("foo", 0), 0);
+        assert_eq!(at("foo", 3), 0);
+        assert_eq!(at("foo bar", 7), 4);
+        assert_eq!(at("foo bar  ", 9), 4);
+        assert_eq!(at("foo bar", 5), 4); // from the middle of a word
+        assert_eq!(at("отчёт год", 9), 6);
+        assert_eq!(at(r"windows\system32", 16), 8);
+        assert_eq!(at(r"windows\", 8), 7);
+        assert_eq!(at("ext:pdf", 4), 3);
+        assert_eq!(at("a_b", 3), 0);
+        assert_eq!(at("a 😀", 4), 2); // never splits a surrogate pair
+        assert_eq!(at("foo", 99), 0); // caret past the end
+    }
 }
